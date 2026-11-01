@@ -214,8 +214,6 @@ client/                    Quest 源码补丁、构建入口与版本依据
 licenses/                  第三方许可
 ```
 
-已移除测试程序、诊断数据、历史备份、旧网页/UDP/步进遥操入口、桌面 UI、D405 采集、数据集导出与 π₀.₅ 训练/推理模块。保留的日志写入是运行与停止诊断所需代码。
-
 ## 许可与来源
 
 保留项目原有 [MIT License](LICENSE)。Quest 适配客户端基于 [XRoboToolkit Unity Client](https://github.com/XR-Robotics/XRoboToolkit-Unity-Client-Quest)，源码提交、补丁及重新构建方法见 [client/README.md](client/README.md)。PC Service 使用 [XRoboToolkit PC Service](https://github.com/XR-Robotics/XRoboToolkit-PC-Service)。第三方归属见 [THIRD_PARTY.md](THIRD_PARTY.md)，对应许可位于 `licenses/`。
