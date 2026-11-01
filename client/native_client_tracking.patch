@@ -1,0 +1,165 @@
+diff --git a/Assets/Scripts/Quest/QuestTrackingDataSource.cs b/Assets/Scripts/Quest/QuestTrackingDataSource.cs
+index 64bbc11..dc001e4 100644
+--- a/Assets/Scripts/Quest/QuestTrackingDataSource.cs
++++ b/Assets/Scripts/Quest/QuestTrackingDataSource.cs
+@@ -86,10 +86,10 @@ public class QuestTrackingDataSource : MonoBehaviour
+     {
+         if (handedness == Handedness.Left)
+         {
+-            return leftController.IsPoseValid;
++            return leftController.IsConnected && leftController.IsPoseValid;
+         }
+ 
+-        return rightController.IsPoseValid;
++        return rightController.IsConnected && rightController.IsPoseValid;
+     }
+ 
+     /// <summary>
+@@ -121,4 +121,4 @@ public class QuestTrackingDataSource : MonoBehaviour
+             poses[i] = joints[i].GetPose();
+         }
+     }
+-}
+\ No newline at end of file
++}
+diff --git a/Assets/Scripts/TrackingData.cs b/Assets/Scripts/TrackingData.cs
+index 0ca85c9..09d07f3 100644
+--- a/Assets/Scripts/TrackingData.cs
++++ b/Assets/Scripts/TrackingData.cs
+@@ -97,13 +97,22 @@ namespace Robot
+         /// <param name="totalData">The JsonData object to populate with tracking information</param>
+         public void Get(ref JsonData totalData)
+         {
++            // Never carry controller samples from an earlier frame across exceptions.
++            totalData = new JsonData();
+             try
+             {
++                totalData["inputProtocol"] = "realman-quest-v1";
+                 //sensor
+                 double predictTime = Time.unscaledTimeAsDouble * 1000000; // Convert to microseconds
+                 totalData["predictTime"] = predictTime; //微秒，对应camera录制中帧插入的时间戳
+                 totalData["appState"] = _stateData;
+                 _stateData["focus"] = Application.isFocused;
++                var hmd = InputDevices.GetDeviceAtXRNode(XRNode.Head);
++                bool userPresent;
++                bool presenceSupported = hmd.TryGetFeatureValue(CommonUsages.userPresence, out userPresent);
++                _stateData["userPresent"] = presenceSupported ? userPresent : OVRPlugin.userPresent;
++                _stateData["presenceSupported"] = presenceSupported;
++                _stateData["presenceSource"] = presenceSupported ? "unity-xr" : "ovr-plugin";
+ 
+                 if (HeadOn)
+                 {
+@@ -155,13 +164,14 @@ namespace Robot
+             catch (System.Exception e)
+             {
+                 Debug.LogError($"TrackingData.Get() failed: {e.StackTrace}");
+-                // Initialize minimal data structure to prevent further crashes
+-                if (!totalData.ContainsKey("predictTime"))
+-                    totalData["predictTime"] = Time.unscaledTimeAsDouble * 1000000;
+-                if (!totalData.ContainsKey("timeStampNs"))
+-                    totalData["timeStampNs"] = System.DateTime.UtcNow.Ticks;
+-                if (!totalData.ContainsKey("Input"))
+-                    totalData["Input"] = 0;
++                totalData = new JsonData();
++                totalData["inputProtocol"] = "realman-quest-v1";
++                totalData["timeStampNs"] = Utils.GetCurrentTimestamp();
++                totalData["Input"] = 0;
++                var failedState = new JsonData();
++                failedState["focus"] = false;
++                failedState["userPresent"] = false;
++                totalData["appState"] = failedState;
+             }
+         }
+         
+@@ -211,7 +221,10 @@ namespace Robot
+         /// <returns>Integer representing the active input device</returns>
+         private int GetActiveInputDevice()
+         {
+-            return questTrackingDataSource.GetActiveInputDevice();
++            var left = InputDevices.GetDeviceAtXRNode(XRNode.LeftHand);
++            var right = InputDevices.GetDeviceAtXRNode(XRNode.RightHand);
++            return (left.isValid && (left.characteristics & InputDeviceCharacteristics.Controller) != 0)
++                || (right.isValid && (right.characteristics & InputDeviceCharacteristics.Controller) != 0) ? 1 : 0;
+         }
+ 
+         /// <summary>
+@@ -227,12 +240,10 @@ namespace Robot
+             if (handedness == Handedness.Left)
+             {
+                 controller = InputDevices.GetDeviceAtXRNode(XRNode.LeftHand);
+-                pose = questTrackingDataSource.GetControllerPose(Handedness.Left);
+             }
+             else
+             {
+                 controller = InputDevices.GetDeviceAtXRNode(XRNode.RightHand);
+-                pose = questTrackingDataSource.GetControllerPose(Handedness.Right);
+             }
+ 
+             // Debug.Log("Handedness: " + handedness + ", Controller: " + controller.name + ", Pose: " + pose);
+@@ -240,6 +251,28 @@ namespace Robot
+             var json = new JsonData();
+             GetControllerJsonData(controller, ref json);
+ 
++            bool tracked;
++            InputTrackingState trackingState;
++            bool hasTracked = controller.TryGetFeatureValue(CommonUsages.isTracked, out tracked);
++            bool hasTrackingState = controller.TryGetFeatureValue(CommonUsages.trackingState, out trackingState);
++            Vector3 rawPosition;
++            Quaternion rawRotation;
++            bool hasPosition = controller.TryGetFeatureValue(CommonUsages.devicePosition, out rawPosition);
++            bool hasRotation = controller.TryGetFeatureValue(CommonUsages.deviceRotation, out rawRotation);
++            bool physicalController = (controller.characteristics & InputDeviceCharacteristics.Controller) != 0;
++            if (hasPosition && hasRotation) pose = new Pose(rawPosition, rawRotation);
++            var required = InputTrackingState.Position | InputTrackingState.Rotation;
++            json["deviceValid"] = controller.isValid;
++            json["isTracked"] = hasTracked && tracked;
++            json["trackingState"] = (int)trackingState;
++            json["controllerDevice"] = physicalController;
++            json["deviceName"] = controller.name;
++            json["poseSource"] = "unity-xr-device";
++            json["poseValid"] = controller.isValid && hasTracked && tracked && hasTrackingState
++                && physicalController && hasPosition && hasRotation
++                && (trackingState & required) == required
++                && Application.isFocused;
++
+             var position = pose.position;
+             var rotation = pose.rotation;
+             ConvertHandedness(ref position, ref rotation);
+@@ -510,4 +543,4 @@ namespace Robot
+             Motion = 2
+         }
+     }
+-}
+\ No newline at end of file
++}
+diff --git a/Assets/Scripts/UI/UIOperate.cs b/Assets/Scripts/UI/UIOperate.cs
+index 2d8aeb3..7a146c6 100644
+--- a/Assets/Scripts/UI/UIOperate.cs
++++ b/Assets/Scripts/UI/UIOperate.cs
+@@ -99,6 +99,19 @@ public class UIOperate : MonoBehaviour
+         OVRPlugin.systemDisplayFrequency = 90.0f;
+     }
+ 
++    // USB edition: the PC launcher prepares adb reverse before opening this app.
++    // Streaming input never starts robot motion; the PC still requires START.
++    private void Start()
++    {
++        ControllerTog.isOn = true;
++        OnControllerTog(true);
++        HandTrackingTog.isOn = false;
++        OnHandTrackingTog(false);
++        SendTog.isOn = true;
++        OnSendTog(true);
++        TcpConnect("127.0.0.1");
++    }
++
+     private void OnSourceConfigOnOnInitialized()
+     {
+         // Update videoSourceDropdown options
+@@ -434,4 +447,4 @@ public class UIOperate : MonoBehaviour
+             SendDataAction.action.Disable();
+         }
+     }
+-}
+\ No newline at end of file
++}

@@ -1,0 +1,16 @@
+{
+  "repository": "https://github.com/XR-Robotics/XRoboToolkit-Unity-Client-Quest",
+  "commit": "07a28333341629008187e988b73b48bced316092",
+  "unity_version": "2021.3.45f2",
+  "unity_revision": "88f88f591b2e",
+  "meta_sdk": "72.0.0",
+  "package_id": "com.xrobotoolkit.client.quest.realman",
+  "version_name": "1.0.1-realman.2",
+  "version_code": 10102,
+  "input_protocol": "realman-quest-v1",
+  "upstream_app_preserved": true,
+  "patch": "native_client_tracking.patch",
+  "compatibility_patch": "native_client_compat.patch",
+  "pose_source": "Unity XR devicePosition/deviceRotation",
+  "build_entry": "unity/RealManQuestBuild.cs"
+}
