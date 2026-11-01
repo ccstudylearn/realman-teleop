@@ -4,7 +4,7 @@
 
 使用流程：**安装 → 配置 IP → 手动设置方向 → 只读预览 → 按保存的方向遥操**。方向设置保存在本机；平移和转腕共用同一套映射，松 Grip 再握住只重建相对起点，不改变方向设置。
 
-本仓库只保留遥操运行所需代码、配置模板与安装脚本。无需 ROS、Unity 编辑器或相机；首次安装需要下载 Python 依赖与 XRoboToolkit PC Service。源码仓库中的 `setup.sh` 还会从本仓库 Release 下载并校验适配 Quest APK。下载 Release 中的完整运行包可省去这些下载。
+本仓库只保留遥操运行所需代码、配置模板与安装脚本。首次安装需要下载 Python 依赖与 XRoboToolkit PC Service。源码仓库中的 `setup.sh` 还会从本仓库 Release 下载并校验适配 Quest APK。下载 Release 中的完整运行包可省去这些下载。
 
 ## 支持环境
 
