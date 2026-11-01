@@ -1,0 +1,16 @@
+{
+  "pc_service": {
+    "version": "1.0.0",
+    "filename": "XRoboToolkit_PC_Service_1.0.0_ubuntu_24.04_amd64.deb",
+    "url": "https://github.com/XR-Robotics/XRoboToolkit-PC-Service/releases/download/v1.0.0/XRoboToolkit_PC_Service_1.0.0_ubuntu_24.04_amd64.deb",
+    "sha256": "bce661f0be0b8a246ceecb2e5f1675a81c26b834648dc7fdf23f8c0bfe2a5d19"
+  },
+  "quest_apk": {
+    "filename": "quest-realman.apk",
+    "url": "https://github.com/ccstudylearn/realman-teleop/releases/download/v1.0.0/quest-realman.apk",
+    "version": "1.0.1-realman.2",
+    "package_id": "com.xrobotoolkit.client.quest.realman",
+    "sha256": "7f098d4d693677e0ef23473e9dfa5174728fdeafd8b371ac84637979006cc63c",
+    "upstream_commit": "07a28333341629008187e988b73b48bced316092"
+  }
+}
