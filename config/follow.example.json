@@ -1,0 +1,20 @@
+{
+  "axis_map": "-x,z,y",
+  "axis_yaw_deg": 0.0,
+  "direction_configured": false,
+  "position_scale": 1.0,
+  "rotation_scale": 0.5,
+  "control_hz": 50.0,
+  "workspace_radius_mm": 400.0,
+  "max_rotation_deg": 180.0,
+  "tcp_speed_mm_s": 100.0,
+  "rotation_speed_deg_s": 60.0,
+  "joint_speed_deg_s": 45.0,
+  "joint_accel_deg_s2": 120.0,
+  "joint_margin_deg": 3.0,
+  "joint_tracking_error_deg": 8.0,
+  "max_duration_s": 3600.0,
+  "gripper_enabled": true,
+  "gripper_speed": 300,
+  "gripper_force": 100
+}

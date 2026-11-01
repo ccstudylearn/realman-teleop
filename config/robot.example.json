@@ -1,0 +1,19 @@
+{
+  "robot_ip": "192.168.0.18",
+  "robot_port": 8080,
+  "feedback_timeout_s": 0.2,
+  "expected_work_frame": "Base",
+  "expected_tool_name": "tcp",
+  "expected_tool_pose_raw": [
+    0,
+    0,
+    145000,
+    0,
+    0,
+    0
+  ],
+  "expected_payload_raw": 500,
+  "expected_collision_stage": 4,
+  "expected_product": "RM65-BI",
+  "expected_firmware": "V1.7.4"
+}
