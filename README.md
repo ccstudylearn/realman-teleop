@@ -37,6 +37,18 @@ bash setup.sh
 
 安装创建项目自己的 `.venv`，锁定 NumPy、SciPy、Robotic_Arm、OpenCV 与 pyrealsense2；PC Service 解压到 `.native/`，不安装成系统服务。安装只检查依赖和离线运动学，不启动机械臂或相机。
 
+新电脑首次连接设备时，安装桌面用户 USB 访问规则，然后重新插拔 Quest 和两台 D405：
+
+```bash
+sudo install -m 644 /dev/stdin /etc/udev/rules.d/99-realman-quest.rules <<'RULES'
+SUBSYSTEM=="usb", ATTR{idVendor}=="2833", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTR{idVendor}=="8086", ATTR{idProduct}=="0b5b", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+RULES
+sudo udevadm control --reload-rules
+```
+
+规则用于本机活动桌面会话访问对应 USB 设备；程序无需以 root 身份运行。
+
 源码仓库首次安装需联网下载依赖；完整运行包优先使用附带 DEB 和 wheels。Ubuntu 系统包仍需 apt 软件源或预先安装。PC Service 使用[上游 v1.0.0 Ubuntu 24.04 发布包](https://github.com/XR-Robotics/XRoboToolkit-PC-Service/releases/tag/v1.0.0)，下载失败可手动放入 `vendor/` 后重新安装。APK/DEB 哈希在 [vendor/manifest.json](vendor/manifest.json)。
 
 ## 2. 配置机器人、相机和保存目录
