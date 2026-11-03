@@ -1,7 +1,5 @@
 {
   "axis_map": "-x,z,y",
-  "axis_yaw_deg": 0.0,
-  "direction_configured": false,
   "position_scale": 1.0,
   "rotation_scale": 0.5,
   "control_hz": 50.0,
@@ -16,5 +14,14 @@
   "max_duration_s": 3600.0,
   "gripper_enabled": true,
   "gripper_speed": 300,
-  "gripper_force": 100
+  "gripper_force": 100,
+  "camera_serial": "UNCONFIGURED_WRIST",
+  "camera_width": 640,
+  "camera_height": 480,
+  "camera_fps": 30,
+  "record_fps": 10,
+  "camera_external_serial": null,
+  "camera_max_skew_s": 0.06,
+  "axis_yaw_deg": 0.0,
+  "direction_configured": false
 }
