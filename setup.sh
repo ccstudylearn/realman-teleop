@@ -29,7 +29,7 @@ fi
 import ctypes
 from xrobotoolkit_input import SDK
 from realman_follow import RealManModel
-import numpy, scipy
+import numpy, scipy, cv2, pyrealsense2
 ctypes.CDLL(str(SDK))
 model = RealManModel([-178,-130,-135,-178,-128,-360], [178,130,135,178,128,360])
 model.fk([0,-30,90,0,60,0])

@@ -34,15 +34,32 @@ def configure(args):
     robot.update(robot_ip=args.robot_ip, robot_port=args.robot_port)
     Config(**robot).validate()
     follow = json.loads((ROOT/'config/follow.example.json').read_text())
+    if bool(args.wrist_serial) != bool(args.external_serial):
+        raise ValueError('双机位需要同时指定 --wrist-serial 和 --external-serial')
+    if args.wrist_serial:
+        follow.update(camera_serial=args.wrist_serial, camera_external_serial=args.external_serial)
+    if not args.data_dir.strip() or (args.mount_point is not None and not args.mount_point.strip()):
+        raise ValueError('保存目录和挂载点不能是空字符串')
     if args.axis_map is not None:
         follow.update(axis_map=args.axis_map, direction_configured=True)
     FollowConfig(**follow).validate()
     write_local(ROOT/'config/robot.json', robot)
     write_local(ROOT/'config/follow.json', follow)
     write_local(ROOT/'config/devices.json', {'quest_serial': args.serial})
-    print('已生成 config/robot.json、follow.json、devices.json；未连接机械臂。')
+    write_local(ROOT/'config/storage.json', {'data_dir': args.data_dir, 'mount_point': args.mount_point})
+    print('已生成本机机器人、方向/相机、设备和保存目录配置；未连接机械臂。')
     print('下一步：bash robot.sh direction 手动设置方向，然后用 preview 逐方向核对。')
     print('再次 configure 会重置跟随参数，并备份旧配置。')
+
+
+def cameras(_args):
+    """Enumerate devices without starting capture or robot control."""
+    import pyrealsense2 as rs
+    devices = [{'name': d.get_info(rs.camera_info.name), 'serial': d.get_info(rs.camera_info.serial_number)}
+               for d in rs.context().query_devices()]
+    print(json.dumps({'cameras': devices, 'robot_motion_enabled': False}, ensure_ascii=False, indent=2))
+    if not devices:
+        raise RuntimeError('未找到 RealSense 相机，请检查 USB 连接和设备访问权限')
 
 
 def load_config():
@@ -173,10 +190,15 @@ def launch(args):
     robot = None
     if args.command != 'monitor':
         robot, config = load_config()
-        if args.command == 'run' and not config.direction_configured:
+        if args.command in ('run', 'record') and not config.direction_configured:
             raise RuntimeError('尚未手动设置方向：先运行 bash robot.sh direction，再用 preview 核对。')
         if args.seconds is not None and args.seconds > config.max_duration_s:
             raise RuntimeError('seconds 超过 config/follow.json 的 max_duration_s。')
+        if args.command == 'record':
+            if not args.task.strip():
+                raise RuntimeError('record 需要 --task 描述示范任务')
+            if config.camera_serial == 'UNCONFIGURED_WRIST' or not config.camera_external_serial:
+                raise RuntimeError('请先 configure 时通过 --wrist-serial 和 --external-serial 指定两个不同的相机序列号')
     check_idle(robot)
     serial = resolve_quest_serial(args.serial)
     installed = subprocess.run(['adb','-s',serial,'shell','pm','path',PACKAGE],
@@ -206,11 +228,15 @@ def launch(args):
             flags = ['--seconds',str(args.seconds)]
         else:
             entry = 'realman_follow.py'
-            flags = ['--direct'] if args.command == 'run' else []
-            if args.command == 'run':
+            flags = ['--direct'] if args.command in ('run', 'record') else []
+            if args.command == 'record':
+                flags += ['--record', '--task', args.task]
+            if args.command in ('run', 'record'):
                 print('真机模式：握右 Grip 可立即运动，松 Grip 停止。',flush=True)
             if args.seconds is not None:
                 flags += ['--seconds',str(args.seconds)]
+        if getattr(args, 'output', None) is not None:
+            flags += ['--output', str(args.output)]
         return wait_child([sys.executable,'-u',str(ROOT/entry),*flags])
     finally:
         if service is not None:
@@ -239,6 +265,15 @@ def main():
     conf.add_argument('--robot-port',type=int,default=8080)
     conf.add_argument('--axis-map',help='可选：配置时同时明确设置方向，如 --axis-map=-x,z,y')
     conf.add_argument('--serial',help='可选：指定 USB Quest 序列号')
+    conf.add_argument('--wrist-serial', help='近景 D405 序列号，录制时必需')
+    conf.add_argument('--external-serial', help='外部 D405 序列号，必须与近景不同')
+    conf.add_argument('--data-dir', default='data', help='保存根目录；相对路径基于项目目录')
+    conf.add_argument('--mount-point', help='可选：要求数据目录位于此真实挂载点，未挂载则拒绝录制')
+    sub.add_parser('cameras', help='枚举 RealSense 设备及序列号，不启动采集或机械臂')
+    probe = sub.add_parser('camera-check', help='仅检查双相机分段落盘，不连接机械臂或 Quest')
+    probe.add_argument('--seconds', type=positive_seconds, default=5.)
+    probe.add_argument('--episodes', type=int, default=2)
+    probe.add_argument('--output', type=Path)
     directions = sub.add_parser('direction', help='手动设置方向，不连接机器人；无参数时交互输入')
     directions.add_argument('--axis-map', help='Base XYZ 对应的 Quest 轴，如 --axis-map=-x,z,y')
     directions.add_argument('--yaw-deg', type=float, help='轴映射后绕 Base +Z 旋转的角度，范围 [-180,180]')
@@ -248,12 +283,30 @@ def main():
     install.add_argument('--serial')
     for command,help_text in [('monitor','仅检查手柄，不连接机器人'),
                               ('preview','读取机器人并计算目标，不发运动或夹爪命令'),
-                              ('run','真机六自由度跟随与夹爪控制')]:
+                              ('run','真机六自由度跟随与夹爪控制'),
+                              ('record','真机遥操 + 双 D405 RGB-D + A/B 分段采集')]:
         mode = sub.add_parser(command,help=help_text)
         mode.add_argument('--serial')
         mode.add_argument('--seconds',type=positive_seconds,
                           default=30. if command=='monitor' else 60. if command=='preview' else None)
+        if command == 'record':
+            mode.add_argument('--task', required=True)
+            mode.add_argument('--output', type=Path)
     args = parser.parse_args()
+    if args.command == 'cameras':
+        return cameras(args)
+    if args.command == 'camera-check':
+        if not 2 <= args.seconds <= 60 or not 1 <= args.episodes <= 10:
+            parser.error('camera-check 要求每段 2–60 秒，1–10 条检查段')
+        _, config = load_config()
+        if config.camera_serial == 'UNCONFIGURED_WRIST' or not config.camera_external_serial:
+            parser.error('请先配置两个不同的 D405 序列号')
+        from recording_storage import data_root, check_recording_output
+        from check_dual_camera_recording import check as camera_check
+        output = args.output or data_root()/'diagnostics'/datetime.now().strftime('dual_camera_probe_%Y%m%dT%H%M%S_%f')
+        check_recording_output(output)
+        asyncio.run(camera_check(config, output, args.seconds, args.episodes))
+        return 0
     if args.command == 'direction':
         if args.show and (args.axis_map is not None or args.yaw_deg is not None):
             parser.error('--show 不能与方向修改参数同时使用')

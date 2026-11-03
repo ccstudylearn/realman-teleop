@@ -4,9 +4,12 @@ __pycache__/
 *.py[cod]
 *.lock
 run/
+data/
 config/robot.json
 config/follow.json
 config/devices.json
+config/storage.json
+vendor/quest-realman.apk
 config/*.before-*
 vendor/*.deb
 vendor/wheels/

@@ -24,18 +24,19 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 from robot_core import parse_axes
-from robot_core import (ROOT, Config, SimpleGate, MotionPermitExpired,
+from robot_core import (ROOT, ArmRPC, Config, SimpleGate, MotionPermitExpired,
                            controlled_stop, preflight, validate_profile)
 from follow_recording import BufferedRecorder
 from follow_transport import FollowRPC
 from gripper_transport import GripperTransport
 
-CONTROL_VERSION = 'scaled-wrist-v4.4-core.2'
+CONTROL_VERSION = 'scaled-wrist-v4.4-dual-public.1'
 
 
 def code_provenance():
-    names = ('realman_follow.py', 'robot_core.py', 'follow_transport.py',
-             'gripper_transport.py', 'follow_recording.py', 'xrobotoolkit_input.py', 'teleop.py')
+    names = ('realman_follow.py', 'robot_core.py', 'follow_transport.py', 'gripper_transport.py', 'episode_recording.py',
+             'episode_session.py', 'camera_layout.py', 'recording_storage.py',
+             'xrobotoolkit_input.py', 'teleop.py', 'follow_recording.py')
     return dict(control_version=CONTROL_VERSION,
                 source_sha256={name: hashlib.sha256((ROOT/name).read_bytes()).hexdigest() for name in names})
 
@@ -60,6 +61,13 @@ class FollowConfig:
     gripper_enabled: bool = True
     gripper_speed: int = 300
     gripper_force: int = 100
+    camera_serial: str = "UNCONFIGURED_WRIST"
+    camera_external_serial: str | None = None
+    camera_max_skew_s: float = .06
+    camera_width: int = 640
+    camera_height: int = 480
+    camera_fps: int = 30
+    record_fps: int = 10
     input_timeout_s: float = .1
 
     def validate(self):
@@ -73,18 +81,34 @@ class FollowConfig:
             value = getattr(self, name)
             if type(value) not in (int, float) or not math.isfinite(value) or not low <= value <= high:
                 raise ValueError(f"{name}: expected finite value within [{low}, {high}]")
-        if type(self.gripper_enabled) is not bool or type(self.direction_configured) is not bool:
-            raise ValueError("gripper_enabled and direction_configured must be boolean")
-        if (type(self.axis_yaw_deg) not in (int, float) or not math.isfinite(self.axis_yaw_deg)
-                or not -180 <= self.axis_yaw_deg <= 180):
-            raise ValueError("axis_yaw_deg must be a finite angle within [-180, 180]")
-        for name, lo, hi in (("gripper_speed", 1, 1000), ("gripper_force", 50, 1000)):
+        if type(self.gripper_enabled) is not bool:
+            raise ValueError("gripper_enabled must be boolean")
+        for name, lo, hi in (("gripper_speed", 1, 1000), ("gripper_force", 50, 1000),
+                             ("record_fps", 1, 30)):
             value = getattr(self, name)
             if type(value) is not int or not lo <= value <= hi:
                 raise ValueError(f"Invalid {name}")
+        if (self.camera_width, self.camera_height, self.camera_fps) != (640, 480, 30):
+            raise ValueError("Camera profile is 640x480@30; output subsampled by record_fps")
+        if not isinstance(self.camera_serial, str) or not self.camera_serial.strip():
+            raise ValueError("Invalid wrist camera serial")
+        if self.camera_external_serial is not None and (
+                not isinstance(self.camera_external_serial, str)
+                or not self.camera_external_serial.strip()
+                or self.camera_external_serial == self.camera_serial):
+            raise ValueError("External camera must have a distinct nonempty serial")
+        if (type(self.camera_max_skew_s) not in (int, float)
+                or not math.isfinite(self.camera_max_skew_s)
+                or not .005 <= self.camera_max_skew_s <= .1):
+            raise ValueError("Camera time difference limit must be 5–100 ms")
         matrix = axis_matrix(self.axis_map)
         if np.linalg.det(matrix) < .99:
             raise ValueError("6D axis mapping must be a proper rotation, not a reflection")
+        if type(self.direction_configured) is not bool:
+            raise ValueError("direction_configured must be boolean")
+        if (type(self.axis_yaw_deg) not in (int, float) or not math.isfinite(self.axis_yaw_deg)
+                or not -180 <= self.axis_yaw_deg <= 180):
+            raise ValueError("axis_yaw_deg must be finite and within [-180,180]")
         return self
 
     @classmethod
@@ -99,7 +123,7 @@ def axis_matrix(mapping, yaw_deg=0.):
     m = np.zeros((3, 3))
     for row, (index, sign) in enumerate(parse_axes(mapping)):
         m[row, index] = sign
-    return Rotation.from_euler('z', yaw_deg, degrees=True).as_matrix() @ m
+    return Rotation.from_euler("z", yaw_deg, degrees=True).as_matrix() @ m
 
 
 def continuous_rotvec(rotation, previous):
@@ -130,6 +154,7 @@ class PoseGate(SimpleGate):
         self.gripper_latched = None
         self.gripper_generation = 0
         self.gripper_intent_stamp = None
+        self.episode_buttons = None
         self.pending_interlock = None
 
     def control_value(self, hand):
@@ -150,6 +175,9 @@ class PoseGate(SimpleGate):
     def trip(self, reason):
         self.trip_motion(reason)
         self.cancel_gripper_intent()
+        buttons = getattr(self, "episode_buttons", None)
+        if buttons and any(word in reason for word in ("native", "tracking lost", "input gap", "sequence reset", "no fresh")):
+            buttons.invalidate()
 
     def cancel_gripper_intent(self):
         self.gripper_edge = None
@@ -206,6 +234,8 @@ class PoseGate(SimpleGate):
                 self.gripper_edge = ("open", now, self.gripper_generation)
                 self.gripper_latched = "open"
                 self.gripper_intent_stamp = now
+        if self.episode_buttons:
+            self.episode_buttons.observe(hand, now)
 
 
 class PlanningConstraint(ValueError):
@@ -586,12 +616,19 @@ class JointStream:
         self.last_sent_at = None
 
 
-async def read_gripper(robot):
-    """Read health only; writes belong exclusively to GripperTransport."""
-    command = "get_gripper_state"
+async def gripper_call(robot, command, config, permit=None):
+    if command not in ("get_gripper_state", "set_gripper_pick", "set_gripper_release"):
+        raise ValueError("Unsupported gripper command")
+    payload = dict(command=command)
+    if command != "get_gripper_state":
+        payload.update(speed=config.gripper_speed, block=False)
+        if command == "set_gripper_pick":
+            payload["force"] = config.gripper_force
     reader, writer = await asyncio.wait_for(asyncio.open_connection(robot.robot_ip, robot.robot_port), .2)
     try:
-        writer.write(json.dumps(dict(command=command)).encode()+b"\r\n")
+        if command != "get_gripper_state" and (permit is None or not permit()):
+            raise MotionPermitExpired("Gripper permit expired")
+        writer.write(json.dumps(payload).encode()+b"\r\n")
         await asyncio.wait_for(writer.drain(), .15)
         deadline = time.monotonic()+.4
         while time.monotonic() < deadline:
@@ -599,8 +636,12 @@ async def read_gripper(robot):
             if not line:
                 raise RuntimeError("Gripper socket disconnected")
             response = json.loads(line)
-            if "gripper_state" in response or response.get("command") == command:
+            if command == "get_gripper_state" and ("gripper_state" in response or response.get("command") == command):
                 return response.get("gripper_state", response)
+            if command != "get_gripper_state" and response.get("command") in ("set_gripper", command):
+                if response.get("state") is not True:
+                    raise RuntimeError("Gripper command rejected")
+                return response
         raise RuntimeError("Gripper response not recognized")
     finally:
         writer.close()
@@ -624,8 +665,11 @@ def check_gripper(state):
         raise ValueError("Gripper unavailable / disabled / error; check end-effector connection")
 
 
-async def run_follow(robot, config, output, *, direct=False, seconds=None):
+async def run_follow(robot, config, output, *, direct=False, seconds=None, record=False, task=""):
     config.validate()
+    if record:
+        from recording_storage import check_recording_output
+        check_recording_output(output)
     recorder = BufferedRecorder(output)
     rpc, gate = FollowRPC(robot, direct, recorder), PoseGate(config)
     stream = JointStream(rpc, recorder, 1/config.control_hz)
@@ -633,18 +677,18 @@ async def run_follow(robot, config, output, *, direct=False, seconds=None):
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
         loop.add_signal_handler(sig, stop.set)
-    source = native_task = feedback = profile_task = gripper_task = gripper_read = lock = None
+    source = native_task = feedback = profile_task = gripper_task = gripper_read = camera = lock = None
     gripper_lane = GripperTransport(robot, config, execute=direct, recorder=recorder)
     gripper_action = None
     report = dict(mode="direct" if direct else "preview", control_version=CONTROL_VERSION,
                   actual_hardware_acceptance=False,
-                  motion_commands_sent=0, gripper_commands_acknowledged=0,
-                  config=asdict(config), provenance=code_provenance())
+                  task=task, motion_commands_sent=0, gripper_commands_acknowledged=0,
+                  training_ready=False, config=asdict(config), provenance=code_provenance())
     try:
         lock = (ROOT/f".realman-{robot.robot_ip}-{robot.robot_port}.lock").open("a+")
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         prepared = await preflight(rpc)
-        recorder.event("preflight", **prepared, follow_config=asdict(config),
+        recorder.event("preflight", **prepared, follow_config=asdict(config), task=task,
                        provenance=report['provenance'])
         model = RealManModel(*prepared["bounds"])
         state = prepared["anchor"]
@@ -660,7 +704,7 @@ async def run_follow(robot, config, output, *, direct=False, seconds=None):
         gripper_state, gripper_stamp, gripper_reason = None, -math.inf, "disabled by configuration"
         if config.gripper_enabled:
             try:
-                gripper_state = await read_gripper(robot)
+                gripper_state = await gripper_call(robot, "get_gripper_state", config)
                 # A disabled gripper still returned a measured state. Keep its
                 # receipt time even when it cannot authorize gripper commands.
                 gripper_stamp = time.monotonic()
@@ -672,11 +716,22 @@ async def run_follow(robot, config, output, *, direct=False, seconds=None):
         gripper_available = gripper_reason == "ready"
         recorder.event("kinematics", sdk_version=model.version, fk_error_mm=error_mm,
                        fk_angle_error_deg=math.degrees(angle_error), gripper_reason=gripper_reason)
+        if record:
+            from episode_session import EpisodeSession
+            def stop_for_episode(reason):
+                old_epoch = gate.epoch
+                gate.trip(reason)
+                if gate.epoch == old_epoch:
+                    gate.epoch += 1
+            camera = EpisodeSession(output, config, task, recorder, stop_for_episode)
+            camera.provenance = report['provenance']
+            await camera.start()
+            gate.episode_buttons = camera.buttons
         from xrobotoolkit_input import NativeInput
         source = NativeInput(grip_threshold=.7)
-        source.defer_close = True  # Persist logs before foreign SDK cleanup.
+        source.defer_close = True  # Persist episode/manifests before foreign SDK cleanup.
         source.start()
-        # SDK/gripper startup can take longer than feedback
+        # Camera warmup and SDK/gripper startup can take longer than feedback
         # freshness. Never reuse the old preflight measurement as live feedback.
         checked = await rpc.profile()
         validate_profile(robot, checked)
@@ -689,8 +744,7 @@ async def run_follow(robot, config, output, *, direct=False, seconds=None):
         native_task = asyncio.create_task(source.pump(gate, lambda: model_pose.tolist()))
         print(f"{'真机' if direct else '只读预览'} 6D跟随 | 平移比例 {config.position_scale} | 转腕比例 {config.rotation_scale:g} | {config.control_hz:g} Hz | 范围半径 {config.workspace_radius_mm:g} mm", flush=True)
         print(f"{CONTROL_VERSION} | movej_follow | TCP上限 {config.tcp_speed_mm_s:g} mm/s | 关节上限 {config.joint_speed_deg_s:g} deg/s | 独立松爪和刹车预检开启", flush=True)
-        print('方向：Base XYZ <- Quest '+config.axis_map+
-              f'，Base Z 轴偏航修正 {config.axis_yaw_deg:g}°；每次运行须先用预览核对方向', flush=True)
+        print(f"方向：Base XYZ <- Quest {config.axis_map}，偏航修正 {config.axis_yaw_deg:g}°", flush=True)
         print("握住右 Grip：平移 / 转动；松开：停止。握 Grip 时按 Trigger：夹取；松 Trigger：张开。Ctrl+C 退出。", flush=True)
         print(f"记录目录：{output}", flush=True)
         recorder.event("started", direct=direct, gripper_available=gripper_available)
@@ -704,9 +758,6 @@ async def run_follow(robot, config, output, *, direct=False, seconds=None):
         unchanged_since = None
         measured_q_reference = np.array(state["joint_deg"])
         async def poll_feedback():
-            # Keep readback alive while the offline IK worker is running.
-            # Only this immutable snapshot reference is replaced here; planner
-            # and tracking state are updated exclusively by the control loop.
             nonlocal latest
             while True:
                 latest = await rpc.snapshot()
@@ -737,6 +788,8 @@ async def run_follow(robot, config, output, *, direct=False, seconds=None):
             native_task.result() if native_task.done() else None
             stream.check()
             gripper_lane.check()
+            if camera:
+                camera.check()
             if feedback is None:
                 feedback = asyncio.create_task(poll_feedback())
             if feedback.done():
@@ -773,9 +826,7 @@ async def run_follow(robot, config, output, *, direct=False, seconds=None):
                 profile_stamp = p["_started_at"]
                 profile_task = None
             if now-latest["received_at"] > robot.feedback_timeout_s or now-profile_stamp > .5:
-                raise RuntimeError("Robot feedback or hardware profile stale: "
-                                   f"feedback_age={now-latest['received_at']:.3f}s, "
-                                   f"profile_age={now-profile_stamp:.3f}s")
+                raise RuntimeError("Robot feedback or hardware profile stale")
             gate.watchdog(now)
             if now-deadline > .08:
                 gate.trip("control scheduler delayed; release Grip")
@@ -814,6 +865,8 @@ async def run_follow(robot, config, output, *, direct=False, seconds=None):
                 tracking = TrackingMonitor(config)
                 gate.trip_motion("stopped; release Grip and squeeze to resume")
                 gate.pending_interlock = None
+                if camera:
+                    camera.finish_after_stop(True if direct and rpc.motion_attempts else None)
                 seen_epoch, active_before, last_plan_reason = gate.epoch, False, ''
                 deadline = time.monotonic()
                 continue
@@ -828,7 +881,7 @@ async def run_follow(robot, config, output, *, direct=False, seconds=None):
                 gripper_task = None
                 gripper_action = None
             if gripper_available and gripper_read is None and now-last_gripper > .2:
-                gripper_read = asyncio.create_task(read_gripper(robot))
+                gripper_read = asyncio.create_task(gripper_call(robot, "get_gripper_state", config))
                 last_gripper = now
             if gripper_read is not None and gripper_read.done():
                 gripper_state = gripper_read.result()
@@ -918,6 +971,7 @@ async def run_follow(robot, config, output, *, direct=False, seconds=None):
                 print(f"{'FOLLOW' if gate.active else 'WAIT'} {gate.reason} R={gate.fresh(time.monotonic())} "
                       f"sent={stream.sent} Grip={gate.hand['grip'] if gate.hand else None} "
                       f"gripper={'ready' if gripper_available else 'unavailable'} "
+                      f"REC={camera.phase if camera else 'off'} "
                       f"lead={tracking.latest_error:.2f}deg rate={planner.feedback_scale:.0%} "
                       f"plan={planner.limiting_reason or 'normal'} "
                       f"actual_xyz={latest['state']['tcp_pose_m_rad'][:3]} "
@@ -930,6 +984,8 @@ async def run_follow(robot, config, output, *, direct=False, seconds=None):
         report.update(status="failed", error=f"{type(error).__name__}: {error}")
         raise
     finally:
+        if camera:
+            camera.closing = True  # Ignore new episode presses once shutdown starts.
         gate.trip("shutdown")
         # Revoke sends and stop the arm before SDK Deinit; native cleanup can
         # block in foreign code and must not delay the physical stop request.
@@ -959,9 +1015,18 @@ async def run_follow(robot, config, output, *, direct=False, seconds=None):
         if stream.periods:
             report["active_send_interval_ms"] = dict(median=float(np.median(stream.periods)*1000),
                                                       maximum=max(stream.periods)*1000)
+        if camera:
+            try:
+                report["recording"] = await camera.close(
+                    reason=report.get("error", report.get("status", "operator_exit")),
+                    stop_verified=report.get("stop_verified"))
+            except Exception as error:
+                report["recording_error"] = str(error)
+                if report.get("stop_verified") is not False:
+                    report["status"] = "recording_incomplete"
         recorder.event("finished", **report)
         report["event_recording"] = await asyncio.to_thread(recorder.close)
-        from follow_recording import write_json
+        from episode_recording import write_json
         report['native_cleanup'] = 'pending' if source else 'not_started'
         write_json(output/'report.json', report)
         try:
@@ -987,14 +1052,22 @@ def main():
     p.add_argument("--robot-config", type=Path, default=ROOT/"config/robot.json")
     p.add_argument("--seconds", type=float)
     p.add_argument("--output", type=Path)
+    p.add_argument("--record", action="store_true", help="手柄分段录制：A 开始/成功结束，B 失败结束")
+    p.add_argument("--task", default="")
     a = p.parse_args()
     c, robot = FollowConfig.load(a.config), Config.load(a.robot_config)
     if a.direct and not c.direction_configured:
         p.error("先运行 bash robot.sh direction 手动设置方向，再用 preview 核对")
+    if a.record and (c.camera_serial == "UNCONFIGURED_WRIST" or not c.camera_external_serial):
+        p.error("双机位录制需要配置 wrist 和 external 两个不同的相机序列号")
     if a.seconds is not None and (not math.isfinite(a.seconds) or not 0 < a.seconds <= c.max_duration_s):
         p.error("seconds exceeds configured duration")
-    out = a.output or ROOT/"run"/datetime.now().strftime("follow_%Y%m%dT%H%M%S_%f")
-    asyncio.run(run_follow(robot, c, out, direct=a.direct, seconds=a.seconds))
+    if a.record and not a.task.strip():
+        p.error("--record requires --task describing this episode")
+    from recording_storage import default_recording_output
+    out = a.output or (default_recording_output() if a.record else
+                       ROOT/"run"/datetime.now().strftime("follow_%Y%m%dT%H%M%S_%f"))
+    asyncio.run(run_follow(robot, c, out, direct=a.direct, seconds=a.seconds, record=a.record, task=a.task))
 
 
 if __name__ == "__main__":

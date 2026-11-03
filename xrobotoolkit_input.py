@@ -57,6 +57,8 @@ def right_hand(data, seq):
     if not all(type(v) in (int, float) and math.isfinite(v) and 0 <= v <= 1 for v in buttons):
         raise ValueError("Invalid native buttons")
     explicit = type(c.get("poseValid")) is bool
+    primary, secondary = c.get("primaryButton"), c.get("secondaryButton")
+    buttons_present = type(primary) is bool and type(secondary) is bool
     # Input is an aggregate mode: left bare-hand visibility can set it to 2
     # while the right physical controller remains tracked. Use per-hand fields.
     valid = (data.get("inputProtocol") == "realman-quest-v1" and explicit and c["poseValid"]
@@ -67,6 +69,9 @@ def right_hand(data, seq):
              and data.get("appState", {}).get("userPresent") is True)
     return {"seq": seq, "valid": bool(valid), "position_m": pose[:3],
             "quaternion_xyzw": pose[3:], "trigger": buttons[0], "grip": buttons[1],
+            "primary_button": primary if buttons_present else None,
+            "secondary_button": secondary if buttons_present else None,
+            "episode_buttons_present": buttons_present,
             "tracking_flag_present": explicit, "pose_present": "pose" in c,
             "input_protocol": data.get("inputProtocol"), "input_mode": data.get("Input"),
             "device_valid": c.get("deviceValid"), "is_tracked": c.get("isTracked"),
