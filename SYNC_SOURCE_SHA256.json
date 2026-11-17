@@ -1,0 +1,16 @@
+{
+  "control_version": "frame-clock-wrist-v4.6",
+  "synchronized_on": "2026-11-17",
+  "local_source_sha256": {
+    "realman_follow.py": "e1561decf3afec2ea00f6fce8486f9a47fd8f05a7eef9139969585cced054f6d",
+    "robot_core.py": "e7a319ce36b58923e68b3f26351dd912f4168dd3970dcd6aa2b5674f7a18e876",
+    "xrobotoolkit_input.py": "a0c19dd2cc0fa224394157357468f43d5152e653bcf063d9c32adfa49d9fb912",
+    "direction_calibration.py": "4840c5f1e87f871df680a3b233593c6d7bff08f14b7bf137816218bf888e4c0d",
+    "calibrate_camera_axes.py": "0a84ba7740658f848f1097ef68f0edc8dd30f8786aa6656e33d26b2a36c52772",
+    "follow_transport.py": "325bbd5199a13b9c169425aaf200c4c0df1790b2275dd9df7bedbda37b68d1ee",
+    "gripper_transport.py": "26758b0ead9f49f415cbfd748f9f40706a1b19aec29b3d5778943e51b12f610b",
+    "episode_recording.py": "77ddf8f22a712ae113300d9b5a4f1c738f9e3c64e5a7177a7f0522bac46f6d32",
+    "episode_session.py": "c840d6a5108f0ba58af94219dd99021461072c7fef6803623a93a0707166d9b2",
+    "camera_layout.py": "8363e85d2a5e7a0d487ab743f8e218fb65bf185a9a61f6356b666bde6c831231"
+  }
+}

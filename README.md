@@ -1,10 +1,18 @@
 # 睿尔曼遥操代码
 
-**v1.1.0：Quest 原生六自由度遥操 + 双 D405 RGB-D 采集 + A/B 分段录制。**
+**当前源码：`frame-clock-wrist-v4.6`（2026-11-17 同步本机版本）。Quest 原生六自由度遥操 + 双 D405 RGB-D 采集 + A/B 分段录制。**
 
-使用流程：安装 → 配置机器人和两台相机 → 手动设置方向 → 只读预览 → 遥操或双机位录制。平移和转腕使用同一套已保存方向；松 Grip 后重新握住只重建相对起点，不改变方向设置。默认转腕比例 0.5。
+使用流程：安装 → 配置机器人和两台相机 → 手动设置方向 → 只读预览 → 遥操或双机位录制。平移和转腕使用同一套已保存方向；松 Grip 后重新握住只重建相对起点，不改变方向设置。新配置默认转腕比例 1.0（1:1）；已有配置不会自动改写。
 
 无需 ROS 或 Unity 编辑器。发布包附带适配 Quest APK；源码仓库安装时自动从 Release 获取并校验。当前版本保留相机原始资料与操作者标签，不包含私人标定、录制数据、模型或训练程序。
+
+## 本次同步
+
+- 输入新鲜度使用 Quest 帧时钟 `predictTime` 和主机原始单调时钟，避免日期校时导致误判；原始 UTC 时间保留用于记录。
+- 同步本机 v4.6 的转腕分量选择、单次规划缓存、逐关节奇异区域预留，以及反馈查询调度。
+- 停止确认允许读取已锁存故障的控制器反馈；启动和运行反馈仍严格拒绝故障状态。
+- 记录输入排队、额外传输延迟与规划耗时；输入过期、Grip、限速、碰撞和停止保护继续生效。
+- 带入固定相机方向标定算法；私人标定和设备配置由使用者在本机生成。同步范围与验证方法见 [SYNC_NOTES.md](SYNC_NOTES.md)。
 
 ## 支持环境
 
@@ -23,9 +31,16 @@
 
 ## 1. 下载和安装
 
-推荐 [完整运行包](https://github.com/ccstudylearn/realman-teleop/releases/download/v1.1.0/realman_quest_teleop-v1.1.0-ubuntu24.04-x86_64.tar.gz)：附带 PC Service、5 个 Python wheels 和 Quest APK。也可下载 [源码包](https://github.com/ccstudylearn/realman-teleop/releases/download/v1.1.0/realman_quest_teleop-v1.1.0-source.zip)，或克隆仓库。
+获取最新源码：
 
-解压后，在 `robot.sh` 所在目录执行：
+```bash
+git clone https://github.com/ccstudylearn/realman-teleop.git
+cd realman-teleop
+```
+
+已克隆的用户可在保留本机配置后执行 `git pull --ff-only`。历史 [v1.1.0 完整运行包](https://github.com/ccstudylearn/realman-teleop/releases/tag/v1.1.0) 仍可下载，但不包含本次控制更新；适配 Quest APK 沿用同一校验版本。更新已有安装时保留 `config/` 中自己的设置；要使用 1:1 转腕，将 `config/follow.json` 的 `rotation_scale` 设置为 `1.0`。
+
+在 `robot.sh` 所在目录执行：
 
 ```bash
 sudo apt update
@@ -119,6 +134,18 @@ bash robot.sh direction --axis-map=-x,z,y --yaw-deg 0
 
 `check` 只读核对硬件和 FK；`preview` 读取反馈、计算目标但不发送运动、停止或夹爪写入命令。预览分别检查右移、前移、上抬和转腕，松 Grip 后 `target_xyz=None`。未设置方向时，真机 `run` 和 `record` 会拒绝启动。
 
+### 可选：与本机版本一致的相机方向标定
+
+已有自己的相机安装标定文件时，可代替手动轴映射执行：
+
+```bash
+bash robot.sh calibrate-axes --mount /path/to/your/camera_mount.json
+bash robot.sh direction --show
+bash robot.sh preview --seconds 60
+```
+
+安装标定文件需含 `camera_frame`（包含 `x right, y down, z forward`）、`robot_frame`（包含 `flange`）和 `T_flange_color_optical` 4×4 矩阵。文件必须属于当前硬件，仓库不附带任何人的真实标定。程序只读机械臂反馈并记录右、上、前三次手势，不发送运动、停止或夹爪命令；如第三次向身体拉回，追加 `--third-direction backward`。固定方向保存到本机 `config/follow.json`；重新握 Grip 只重设相对起点。头显应用重启后需重新标定和预览核对。再次运行手动 `direction` 会清除相机方向标定并使用所填映射。
+
 ## 4. 双相机检查与 A/B 录制
 
 先单独检查双相机的启动、分段保存、PNG 可读性和一对一配对：
@@ -153,7 +180,7 @@ bash robot.sh record --task "把物体放进托盘"
 
 ## 控制参数与停止保护
 
-模板参数：平移比例 1.0、转腕比例 0.5、控制目标 50 Hz、TCP 上限 100 mm/s、关节上限 45°/s、关节加速度 120°/s²、启动 TCP 周围半径 400 mm。重新握 Grip 不扩大该范围。`--seconds` 可缩短运行时长。
+模板参数：平移比例 1.0、转腕比例 1.0、控制目标 50 Hz、TCP 上限 100 mm/s、关节上限 45°/s、关节加速度 120°/s²、启动 TCP 周围半径 400 mm。重新握 Grip 不扩大该范围。`--seconds` 可缩短运行时长。
 
 保留输入过期、重复帧、追踪/焦点丢失、位姿跳变、关节限位、奇异性、自碰撞、刹车轨迹、反馈时效和配置变化检查。故障后松开再重新握 Grip，不保持握住自动恢复。任一路相机故障或有效帧心跳停滞约 1 秒，会进入现有停止流程。
 
@@ -163,7 +190,8 @@ bash robot.sh record --task "把物体放进托盘"
 
 - `teleop.py`、`robot.sh`：统一入口、设备配置、手动方向与启动。
 - `realman_follow.py`、`robot_core.py`、`follow_transport.py`、`gripper_transport.py`：跟随、预检与停止保护。
-- `xrobotoolkit_input.py`：原生输入及 A/B、Grip、Trigger 的逐帧状态。
+- `xrobotoolkit_input.py`：原生输入、帧时钟诊断及 A/B、Grip、Trigger 的逐帧状态。
+- `direction_calibration.py`、`calibrate_camera_axes.py`：固定相机参考与只读方向标定。
 - `episode_recording.py`、`episode_session.py`、`camera_layout.py`、`follow_recording.py`：双路采集、分段、配对与有界日志。
 - `recording_storage.py`：可配置保存位置、挂载及空间检查。
 - `check_dual_camera_recording.py`：仅相机落盘检查。

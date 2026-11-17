@@ -74,6 +74,7 @@ def direction(args):
     """Edit only local direction settings; never start ADB, SDK or robot RPC."""
     from dataclasses import asdict, replace
     from realman_follow import axis_matrix
+    from direction_calibration import camera_axis_matrix
     _, current = load_config()
     if args.show:
         mapping, yaw = current.axis_map, current.axis_yaw_deg
@@ -91,12 +92,15 @@ def direction(args):
             mapping = mapping if mapping is not None else current.axis_map
             yaw = yaw if yaw is not None else current.axis_yaw_deg
         updated = replace(current, axis_map=mapping, axis_yaw_deg=yaw,
-                          direction_configured=True).validate()
+                          direction_configured=True, direction_calibration=None).validate()
         write_local(ROOT/'config/follow.json', asdict(updated))
         configured = True
-    matrix = axis_matrix(mapping, yaw)
+    calibration = current.direction_calibration if args.show else None
+    matrix = (camera_axis_matrix([0., 0., 0.], calibration) if calibration
+              else axis_matrix(mapping, yaw))
     print(json.dumps(dict(direction_configured=configured, axis_map=mapping,
-                          axis_yaw_deg=yaw, quest_to_base_rotation=matrix.tolist(),
+                          axis_yaw_deg=yaw, calibration_active=calibration is not None,
+                          quest_to_base_rotation=matrix.tolist(),
                           robot_motion_enabled=False), ensure_ascii=False, indent=2))
     if not args.show:
         print('方向已保存，其他速度和夹爪参数保留。下一步：bash robot.sh preview --seconds 60')
@@ -199,6 +203,11 @@ def launch(args):
                 raise RuntimeError('record 需要 --task 描述示范任务')
             if config.camera_serial == 'UNCONFIGURED_WRIST' or not config.camera_external_serial:
                 raise RuntimeError('请先 configure 时通过 --wrist-serial 和 --external-serial 指定两个不同的相机序列号')
+    if args.command == 'calibrate-axes':
+        if not args.mount.is_file():
+            raise RuntimeError('请通过 --mount 指定自己的相机安装标定文件')
+        if config.camera_serial == 'UNCONFIGURED_WRIST':
+            raise RuntimeError('请先配置近景 D405 序列号')
     check_idle(robot)
     serial = resolve_quest_serial(args.serial)
     installed = subprocess.run(['adb','-s',serial,'shell','pm','path',PACKAGE],
@@ -223,7 +232,18 @@ def launch(args):
         subprocess.run(['adb','-s',serial,'shell','am','start','-n',
                         PACKAGE+'/com.unity3d.player.UnityPlayerActivity'],check=True)
         print('佩戴头显并保持应用在前台。客户端连接地址 127.0.0.1；Controller + Send 开启。',flush=True)
-        if args.command == 'monitor':
+        if args.command in ('run', 'record') and config.direction_calibration:
+            expected = config.direction_calibration.get('quest_app_pid')
+            current = subprocess.run(['adb', '-s', serial, 'shell', 'pidof', PACKAGE],
+                                     capture_output=True, text=True, check=False)
+            if expected and (not current.stdout.strip() or int(current.stdout.split()[0]) != expected):
+                raise RuntimeError('头显应用已重启，方向参考可能改变；请重新 calibrate-axes 并预览核对')
+        if args.command == 'calibrate-axes':
+            entry = 'calibrate_camera_axes.py'
+            flags = ['--three-axes', '--third-direction', args.third_direction,
+                     '--mount', str(args.mount.resolve()), '--serial', serial,
+                     '--seconds', str(args.seconds)]
+        elif args.command == 'monitor':
             entry = 'xrobotoolkit_input.py'
             flags = ['--seconds',str(args.seconds)]
         else:
@@ -278,6 +298,11 @@ def main():
     directions.add_argument('--axis-map', help='Base XYZ 对应的 Quest 轴，如 --axis-map=-x,z,y')
     directions.add_argument('--yaw-deg', type=float, help='轴映射后绕 Base +Z 旋转的角度，范围 [-180,180]')
     directions.add_argument('--show', action='store_true', help='只显示当前设置')
+    calibration = sub.add_parser('calibrate-axes', help='只读记录右、上、前三方向，使用自己的相机安装标定')
+    calibration.add_argument('--mount', type=Path, required=True)
+    calibration.add_argument('--serial')
+    calibration.add_argument('--seconds', type=positive_seconds, default=180.)
+    calibration.add_argument('--third-direction', choices=('forward', 'backward'), default='forward')
     sub.add_parser('check',help='只读检查硬件配置与模型，不发运动/停止/夹爪命令')
     install = sub.add_parser('install-quest',help='通过 USB 安装随附的适配 APK')
     install.add_argument('--serial')
@@ -293,6 +318,8 @@ def main():
             mode.add_argument('--task', required=True)
             mode.add_argument('--output', type=Path)
     args = parser.parse_args()
+    if args.command == 'calibrate-axes' and not 1 <= args.seconds <= 600:
+        parser.error('calibrate-axes 要求 1–600 秒')
     if args.command == 'cameras':
         return cameras(args)
     if args.command == 'camera-check':

@@ -6,6 +6,7 @@ its coordinates are displayed but cannot authorize motion.
 """
 import argparse
 import asyncio
+from collections import Counter
 import ctypes as C
 import fcntl
 import json
@@ -39,6 +40,22 @@ def decode_state_json(raw):
     if type(stamp) is not int or stamp <= 0:
         raise ValueError("Native state has no integer frame timestamp")
     return data
+
+
+def frame_clock(data):
+    """Use the frame clock already sent by r2, independent of Android UTC.
+
+    TrackingData.Get sends Time.unscaledTimeAsDouble * 1e6 in predictTime.
+    timeStampNs uses DateTime.UtcNow and can slew during time synchronisation.
+    Keep UTC for recording; use the frame clock for deduplication and latency.
+    Legacy packets retain the original strict UTC checks.
+    """
+    if "predictTime" in data:
+        value = data["predictTime"]
+        if type(value) not in (int, float) or not math.isfinite(value) or not 0 <= value <= 1e15:
+            raise ValueError("Invalid native monotonic frame timestamp")
+        return "unity_unscaled", round(value*1000)
+    return "utc_legacy", data["timeStampNs"]
 
 
 def right_hand(data, seq):
@@ -93,7 +110,12 @@ class NativeInput:
         self.lib = None
         self.lock = None
         self.callback = Callback(self._callback)  # Keep callback alive until Deinit.
-        self.last_stamp = self.offset = self.last_arrival = None
+        self.last_stamp = self.transport_offset_ns = self.last_arrival = None
+        self.clock = None
+        self.timing = {}
+        self.last_fault = None
+        self.fault_counts = Counter()
+        self.maximum_queue_age_s = self.maximum_transport_excess_s = 0.
         self.seq = self.frames = self.rejected = self.tracking_frames = 0
         self.last = None
         self.last_error = "waiting for native packets"
@@ -110,7 +132,12 @@ class NativeInput:
                     self.device = device
                 if device != self.device:
                     return
-                self.items.put_nowait((time.monotonic(), bytes(state.stateJson)))
+                # Linux can slew CLOCK_MONOTONIC during NTP corrections.
+                # Keep it for host deadlines and logs, but use the raw clock
+                # to compare elapsed time against the headset's frame clock.
+                arrival = time.monotonic()
+                transport_arrival_ns = time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW)
+                self.items.put_nowait((arrival, transport_arrival_ns, bytes(state.stateJson)))
         except Exception:
             self.fault.set()  # Overflow or malformed ABI payload fails closed.
 
@@ -158,49 +185,81 @@ class NativeInput:
                     self.items.get_nowait()
                 except queue.Empty:
                     break
-            self.last_stamp = self.offset = self.last_arrival = None
+            self.last_stamp = self.transport_offset_ns = self.last_arrival = None
+            self.clock = None
             self.last_error = "native device/service disconnected or callback overflow"
+            self._record_fault(self.last_error)
             trip(self.last_error)
             return
         for _ in range(128):
             try:
-                arrival, raw = self.items.get_nowait()
+                arrival, transport_arrival_ns, raw = self.items.get_nowait()
             except queue.Empty:
                 return
             try:
                 data = decode_state_json(raw)
-                stamp = data["timeStampNs"]
+                clock, stamp = frame_clock(data)
+                if self.clock is not None and clock != self.clock:
+                    self.clock = clock
+                    self.last_stamp = self.last_arrival = self.transport_offset_ns = None
+                    raise ValueError("native frame clock changed; release Grip")
+                self.clock = clock
                 if stamp == self.last_stamp:
                     duplicate = right_hand(data, self.seq)
                     if not duplicate["valid"] or (self.last and
                             ((self.last["grip"] >= self.grip_threshold and duplicate["grip"] < self.grip_threshold) or
                              (min(self.last["grip"], self.last["trigger"]) >= .8 and
                               min(duplicate["grip"], duplicate["trigger"]) < .8))):
-                        trip("native duplicate frame lost tracking/focus or released control")
+                        self.last_error = "native duplicate frame lost tracking/focus or released control"
+                        self._record_fault(self.last_error)
+                        trip(self.last_error)
                     continue  # A repeated source frame never refreshes freshness.
                 prior_stamp, prior_arrival = self.last_stamp, self.last_arrival
-                offset = arrival - stamp / 1e9
-                self.offset = offset if self.offset is None else min(offset, self.offset)
+                offset_ns = transport_arrival_ns - stamp
+                if self.transport_offset_ns is None or offset_ns < self.transport_offset_ns:
+                    self.transport_offset_ns = offset_ns
                 self.last_stamp, self.last_arrival = stamp, arrival
                 self.seq += 1
                 hand = right_hand(data, self.seq)
-                hand["source_timestamp_ns"] = stamp
+                hand["source_timestamp_ns"] = data["timeStampNs"]
+                hand["source_clock"] = clock
+                hand["source_frame_timestamp_ns"] = stamp
                 self.last = hand
                 self.frames += 1
                 self.tracking_frames += int(hand["valid"])
-                if now - arrival > .03 or offset - self.offset > .05:
-                    raise ValueError("native frame backlog")
+                queue_age = max(0., now-arrival)
+                transport_excess = (offset_ns-self.transport_offset_ns)/1e9
+                self.timing = dict(clock=clock, transport_clock="host_monotonic_raw", queue_age_ms=queue_age*1000,
+                                   transport_excess_ms=transport_excess*1000,
+                                   arrival_gap_ms=None if prior_arrival is None else (arrival-prior_arrival)*1000,
+                                   source_gap_ms=None if prior_stamp is None else (stamp-prior_stamp)/1e6,
+                                   queue_depth=self.items.qsize())
+                self.maximum_queue_age_s = max(self.maximum_queue_age_s, queue_age)
+                self.maximum_transport_excess_s = max(self.maximum_transport_excess_s, transport_excess)
                 if prior_stamp is not None and (stamp < prior_stamp or
                         (stamp-prior_stamp)/1e9 > .1 or arrival-prior_arrival > .1):
-                    self.offset = offset
+                    self.transport_offset_ns = offset_ns
                     raise ValueError("native frame clock reset or input gap")
+                if queue_age > .03 or transport_excess > .05:
+                    raise ValueError("native frame backlog")
                 self.last_error = ("" if hand["valid"] else
                                    "right tracking invalid or explicit poseValid missing")
                 observe(hand, arrival)
             except (ValueError, TypeError, KeyError, AttributeError, OverflowError) as error:
                 self.rejected += 1
                 self.last_error = str(error)
+                self._record_fault(self.last_error)
                 trip("native input: " + str(error))
+
+    def _record_fault(self, reason):
+        self.fault_counts[reason] += 1
+        self.last_fault = dict(reason=reason, **self.timing)
+
+    def diagnostics(self):
+        return dict(last_frame=self.timing.copy(), last_fault=self.last_fault,
+                    fault_counts=dict(self.fault_counts),
+                    maximum_queue_age_ms=self.maximum_queue_age_s*1000,
+                    maximum_transport_excess_ms=self.maximum_transport_excess_s*1000)
 
     async def pump(self, gate, pose):
         try:
@@ -231,7 +290,8 @@ async def monitor(seconds, output):
                 age = None if source.last_arrival is None else time.monotonic()-source.last_arrival
                 print(json.dumps({"frames": source.frames, "device": source.device,
                                   "frame_age_s": age, "stream_fresh": age is not None and age <= .1,
-                                  "right": source.last, "error": source.last_error}, ensure_ascii=False), flush=True)
+                                  "right": source.last, "error": source.last_error,
+                                  "input_timing": source.diagnostics()}, ensure_ascii=False), flush=True)
                 printed = time.monotonic()
             await asyncio.sleep(.005)
     finally:
@@ -239,7 +299,8 @@ async def monitor(seconds, output):
         if stream:
             stream.close()
         print(json.dumps({"frames": source.frames, "valid_tracking_frames": source.tracking_frames,
-                          "rejected": source.rejected, "robot_commands_sent": 0}), flush=True)
+                          "rejected": source.rejected, "robot_commands_sent": 0,
+                          "input_timing": source.diagnostics()}), flush=True)
 
 
 if __name__ == "__main__":

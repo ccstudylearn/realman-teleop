@@ -29,14 +29,16 @@ from robot_core import (ROOT, ArmRPC, Config, SimpleGate, MotionPermitExpired,
 from follow_recording import BufferedRecorder
 from follow_transport import FollowRPC
 from gripper_transport import GripperTransport
+from direction_calibration import camera_axis_matrix
 
-CONTROL_VERSION = 'scaled-wrist-v4.4-dual-public.1'
+CONTROL_VERSION = 'frame-clock-wrist-v4.6'
 
 
 def code_provenance():
     names = ('realman_follow.py', 'robot_core.py', 'follow_transport.py', 'gripper_transport.py', 'episode_recording.py',
              'episode_session.py', 'camera_layout.py', 'recording_storage.py',
-             'xrobotoolkit_input.py', 'teleop.py', 'follow_recording.py')
+             'xrobotoolkit_input.py', 'teleop.py', 'follow_recording.py',
+             'direction_calibration.py', 'calibrate_camera_axes.py')
     return dict(control_version=CONTROL_VERSION,
                 source_sha256={name: hashlib.sha256((ROOT/name).read_bytes()).hexdigest() for name in names})
 
@@ -47,7 +49,7 @@ class FollowConfig:
     axis_yaw_deg: float = 0.
     direction_configured: bool = False
     position_scale: float = 1.
-    rotation_scale: float = 0.5
+    rotation_scale: float = 1.
     control_hz: float = 50.
     workspace_radius_mm: float = 400.
     max_rotation_deg: float = 180.
@@ -69,6 +71,7 @@ class FollowConfig:
     camera_fps: int = 30
     record_fps: int = 10
     input_timeout_s: float = .1
+    direction_calibration: dict | None = None
 
     def validate(self):
         bounds = dict(position_scale=(.1, 2.), rotation_scale=(0., 1.5), control_hz=(20., 50.),
@@ -109,6 +112,11 @@ class FollowConfig:
         if (type(self.axis_yaw_deg) not in (int, float) or not math.isfinite(self.axis_yaw_deg)
                 or not -180 <= self.axis_yaw_deg <= 180):
             raise ValueError("axis_yaw_deg must be finite and within [-180,180]")
+        if self.direction_calibration is not None:
+            c = self.direction_calibration
+            if not isinstance(c, dict) or c.get('camera_serial') != self.camera_serial:
+                raise ValueError('Direction calibration camera serial does not match')
+            camera_axis_matrix([0., 0., 0.], c)
         return self
 
     @classmethod
@@ -209,6 +217,12 @@ class PoseGate(SimpleGate):
         super().observe(hand, now, robot_pose)
         if self.active:
             if not was_active:
+                if self.c.direction_calibration is not None:
+                    try:
+                        self.matrix = camera_axis_matrix(robot_pose[3:], self.c.direction_calibration)
+                    except ValueError as error:
+                        self.trip(str(error))
+                        return
                 self.rotation_anchor = (rotation, Rotation.from_euler("xyz", robot_pose[3:]))
                 self.rotation_vector = np.zeros(3)
             origin, tcp_pose = self.anchor
@@ -298,6 +312,7 @@ class JointPlanner:
         self.limiting_reason = ''
         self.component = 'six_d'
         self.state_checked = False
+        self._rotation_probe_index = 0
 
     def observe(self, q, stamp):
         q = np.array(q, dtype=float)
@@ -320,7 +335,28 @@ class JointPlanner:
         if angle > math.radians(self.c.max_rotation_deg) + .002:
             raise ValueError("Target outside configured rotation range")
 
+    def _fk(self, q):
+        key = tuple(q)
+        if key not in self._fk_cache:
+            self._fk_cache[key] = self.model.fk(q)
+        return self._fk_cache[key]
+
+    def _check_model(self, q):
+        key = tuple(q)
+        if key not in self._checked:
+            try:
+                self.model.check(q)
+                self._checked[key] = None
+            except PlanningConstraint as error:
+                self._checked[key] = (error.kind, str(error))
+        failure = self._checked[key]
+        if failure is not None:
+            raise PlanningConstraint(*failure)
+
     def step(self, target, dt):
+        # Reuse only identical offline states within this one planning tick.
+        # Every distinct ideal/encoded/braking state still passes all checks.
+        self._fk_cache, self._checked, self._braking_cache = {}, {}, {}
         # Fixed upper time step: scheduler delays never cause larger catch-up steps.
         if not math.isfinite(dt) or dt <= 0:
             raise ValueError('Invalid planner timestep')
@@ -334,11 +370,11 @@ class JointPlanner:
         if workspace_limited:
             target[:3] = self.origin[:3]+offset*(radius-1e-5)/np.linalg.norm(offset)
         self.check_pose(target)
-        pose = self.model.fk(self.q)
+        pose = self._fk(self.q)
         if not self.state_checked:
             # A soft candidate boundary is different from starting inside an
             # unsafe measured state. The latter still latches the stop gate.
-            self.model.check(self.q)
+            self._check_model(self.q)
             self._check_joint_margin(self.q)
             self.state_checked = True
         d = np.array(target[:3])-pose[:3]
@@ -351,6 +387,13 @@ class JointPlanner:
         primary = self._proposal(pose, d*task_fraction, rv*task_fraction, dt)
         chosen = primary
         component = 'six_d'
+        def progress(result):
+            # Compare task progress in seconds at the configured linear/angular
+            # speeds. Tiny translation drift must not starve an intended turn.
+            moved = (result['pose'][:3]-pose[:3])@d/max(np.linalg.norm(d), 1e-12)
+            turned = (Rotation.from_euler('xyz', result['pose'][3:])*rotation.inv()).as_rotvec()
+            angular = turned@rv/max(np.linalg.norm(rv), 1e-12)
+            return moved/(self.c.tcp_speed_mm_s/1000) + angular/math.radians(self.c.rotation_speed_deg_s)
         # At a wrist/elbow boundary, requested rotation can block a feasible
         # lift. Try the operator's translation with orientation held, then the
         # requested rotation with position held. Never invent an escape motion.
@@ -381,17 +424,43 @@ class JointPlanner:
                     chosen = vertical
                     chosen['reason'] = 'vertical_priority_'+primary['reason']
                     component = 'vertical'
-            if chosen is primary and np.linalg.norm(rv) > 1e-5:
+            angular_tick = min(np.linalg.norm(rv), math.radians(self.c.rotation_speed_deg_s)*dt)
+            if (np.linalg.norm(rv) > 1e-5 and
+                    progress(chosen)+1e-5 < angular_tick/math.radians(self.c.rotation_speed_deg_s)):
                 turn = self._proposal(pose, np.zeros(3), rv*min(1., math.radians(
                     self.c.rotation_speed_deg_s)*dt/np.linalg.norm(rv)), dt)
                 direction = rv/np.linalg.norm(rv)
                 def angular_progress(result):
                     return (Rotation.from_euler('xyz', result['pose'][3:])*
                             rotation.inv()).as_rotvec()@direction
-                if angular_progress(turn) > max(0., angular_progress(primary))+1e-4:
+                if (angular_progress(turn) > max(0., angular_progress(chosen))+1e-4
+                        and progress(turn) > max(0., progress(chosen))+1e-5):
                     chosen = turn
                     chosen['reason'] = 'rotation_priority_'+primary['reason']
                     component = 'rotation'
+                # A requested pitch can be blocked while its roll/yaw component
+                # remains feasible. Keep those requested components available;
+                # never rotate in an invented escape direction. Only probe when
+                # the complete turn makes little angular progress.
+                if angular_progress(turn) < min(np.linalg.norm(rv), math.radians(
+                        self.c.rotation_speed_deg_s)*dt)*.1:
+                    axes = [axis for axis in np.argsort(-np.abs(rv)) if abs(rv[axis]) >= .005]
+                    if axes:
+                        # Keep a productive axis across ticks for continuous
+                        # acceleration; rotate the probe only when it is blocked.
+                        # Alternating every tick would repeatedly brake a valid turn.
+                        axis = axes[self._rotation_probe_index % len(axes)]
+                        partial = np.zeros(3)
+                        partial[axis] = np.clip(rv[axis], -math.radians(
+                            self.c.rotation_speed_deg_s)*dt, math.radians(self.c.rotation_speed_deg_s)*dt)
+                        proposal = self._proposal(pose, np.zeros(3), partial, dt)
+                        if (angular_progress(proposal) > max(0., angular_progress(chosen))+1e-4
+                                and progress(proposal) > max(0., progress(chosen))+1e-5):
+                            chosen = proposal
+                            chosen['reason'] = 'rotation_axis_priority_'+primary['reason']
+                            component = 'rotation_'+('x', 'y', 'z')[axis]
+                        else:
+                            self._rotation_probe_index += 1
         self.q, self.velocity = chosen['q'], chosen['velocity']
         self.feedback_scale, self.trajectory_scale = chosen['feedback_scale'], chosen['fraction']
         self.limiting_reason = chosen['reason'] or ('workspace' if workspace_limited else '')
@@ -477,7 +546,7 @@ class JointPlanner:
 
     def _check_transition(self, previous_q, previous_pose, q, dt):
         self._check_joint_margin(q, planning=True)
-        actual_pose = self.model.fk(q)
+        actual_pose = self._fk(q)
         try:
             self.check_pose(actual_pose)
         except ValueError as error:
@@ -488,14 +557,14 @@ class JointPlanner:
                  Rotation.from_euler('xyz', previous_pose[3:]).inv()).magnitude()
         if angle > math.radians(self.c.rotation_speed_deg_s)*dt + 1e-5:
             raise PlanningConstraint('angular_speed', 'Planned angular speed exceeded configured limit')
-        self.model.check(q)
+        self._check_model(q)
         # The wire uses millidegrees. Validate the actual encoded target too;
         # rounding must not take a valid ideal target across a model boundary.
         encoded_q, encoded_previous = np.round(q, 3), np.round(previous_q, 3)
         self._check_joint_margin(encoded_q, planning=True)
-        self.model.check(encoded_q)
-        encoded_pose = self.model.fk(encoded_q)
-        encoded_previous_pose = self.model.fk(encoded_previous)
+        self._check_model(encoded_q)
+        encoded_pose = self._fk(encoded_q)
+        encoded_previous_pose = self._fk(encoded_previous)
         if np.linalg.norm(encoded_pose[:3]-encoded_previous_pose[:3]) > self.c.tcp_speed_mm_s/1000*dt + 1e-6:
             raise PlanningConstraint('tcp_speed', 'Encoded TCP speed exceeded configured limit')
         encoded_angle = (Rotation.from_euler('xyz', encoded_pose[3:])*
@@ -505,9 +574,24 @@ class JointPlanner:
         return actual_pose
 
     def _check_braking_path(self, pose, velocity, dt):
+        key = (tuple(velocity), dt)
+        if key not in self._braking_cache:
+            try:
+                self._braking_cache[key] = (self._rollout_braking_path(pose, velocity, dt), None)
+            except PlanningConstraint as error:
+                self._braking_cache[key] = (None, (error.kind, str(error)))
+        result, failure = self._braking_cache[key]
+        if failure is not None:
+            raise PlanningConstraint(*failure)
+        return result
+
+    def _rollout_braking_path(self, pose, velocity, dt):
         q, previous_pose = self.q.copy(), pose
         first_q = first_pose = None
-        approach_direction = velocity/max(np.max(np.abs(velocity)), 1e-12)
+        # Reserve a full half degree for each approaching joint. Normalising
+        # by the fastest joint let a slow elbow/wrist component creep closer
+        # to singularity while another joint dominated a partial turn.
+        approach_direction = np.where(np.abs(velocity) > 1e-8, np.sign(velocity), 0.)
         # At the configured maximum this is <= 19 ticks at 50 Hz. No robot
         # commands are sent by this rollout; the SDK is offline kinematics only.
         ticks = int(math.ceil(np.max(np.abs(velocity))/self.c.joint_accel_deg_s2/dt))+2
@@ -518,11 +602,11 @@ class JointPlanner:
             if index == 0:
                 first_q, first_pose = q.copy(), actual_pose.copy()
             if np.max(np.abs(velocity)) < 1e-9:
-                # A directional 0.5-degree joint-space reserve avoids parking
+                # A directional 0.5-degree reserve per moving joint avoids parking
                 # on the SDK's exact singularity threshold. This probe is never
                 # commanded; actual braking states passed all model checks.
                 try:
-                    self.model.check(q+approach_direction*.5)
+                    self._check_model(q+approach_direction*.5)
                 except PlanningConstraint as error:
                     if error.kind == 'singularity':
                         raise
@@ -683,6 +767,7 @@ async def run_follow(robot, config, output, *, direct=False, seconds=None, recor
     report = dict(mode="direct" if direct else "preview", control_version=CONTROL_VERSION,
                   actual_hardware_acceptance=False,
                   task=task, motion_commands_sent=0, gripper_commands_acknowledged=0,
+                  planning_timing=dict(ticks=0, over_budget_ticks=0, maximum_ms=0.),
                   training_ready=False, config=asdict(config), provenance=code_provenance())
     try:
         lock = (ROOT/f".realman-{robot.robot_ip}-{robot.robot_port}.lock").open("a+")
@@ -744,25 +829,24 @@ async def run_follow(robot, config, output, *, direct=False, seconds=None, recor
         native_task = asyncio.create_task(source.pump(gate, lambda: model_pose.tolist()))
         print(f"{'真机' if direct else '只读预览'} 6D跟随 | 平移比例 {config.position_scale} | 转腕比例 {config.rotation_scale:g} | {config.control_hz:g} Hz | 范围半径 {config.workspace_radius_mm:g} mm", flush=True)
         print(f"{CONTROL_VERSION} | movej_follow | TCP上限 {config.tcp_speed_mm_s:g} mm/s | 关节上限 {config.joint_speed_deg_s:g} deg/s | 独立松爪和刹车预检开启", flush=True)
-        print(f"方向：Base XYZ <- Quest {config.axis_map}，偏航修正 {config.axis_yaw_deg:g}°", flush=True)
+        if config.direction_calibration:
+            fixed = 'target_basis_base' in config.direction_calibration
+            print('方向：'+('固定校准参考；右/左按校准时D405画面，前/后沿桌面，上/下为Base Z'
+                          if fixed else '旧相机参考；每次握Grip按当前相机朝向重算'), flush=True)
+        else:
+            print(f'方向：Base XYZ <- Quest {config.axis_map}，偏航修正 {config.axis_yaw_deg:g}°', flush=True)
         print("握住右 Grip：平移 / 转动；松开：停止。握 Grip 时按 Trigger：夹取；松 Trigger：张开。Ctrl+C 退出。", flush=True)
         print(f"记录目录：{output}", flush=True)
         recorder.event("started", direct=direct, gripper_available=gripper_available)
         start = deadline = time.monotonic()
-        last_profile = last_print = last_gripper = -math.inf
-        processed_feedback_stamp = None
+        last_feedback = last_profile = last_print = last_gripper = -math.inf
         profile_stamp = checked["_started_at"]
         seen_epoch = gate.epoch
         active_before = False
         last_plan_reason = ''
         unchanged_since = None
         measured_q_reference = np.array(state["joint_deg"])
-        async def poll_feedback():
-            nonlocal latest
-            while True:
-                latest = await rpc.snapshot()
-                await asyncio.sleep(.05)
-
+        last_planning_ms = 0.
         def record_observation(snapshot):
             measured_at = time.monotonic()
             recorder.event("observation", query_started=snapshot["received_at"],
@@ -776,8 +860,10 @@ async def run_follow(robot, config, output, *, direct=False, seconds=None, recor
                            trajectory_scale=planner.trajectory_scale,
                            planner_limiting_reason=planner.limiting_reason,
                            planner_component=planner.component,
+                           planning_duration_ms=last_planning_ms,
                            native_frames=source.frames, native_device=getattr(source, 'device', None),
                            native_last_error=getattr(source, 'last_error', None),
+                           input_timing=(source.diagnostics() if hasattr(source, 'diagnostics') else None),
                            gripper=gripper_state,
                            gripper_last_command=gripper_lane.last_command,
                            gripper_last_command_at=gripper_lane.last_sent_at,
@@ -790,12 +876,12 @@ async def run_follow(robot, config, output, *, direct=False, seconds=None, recor
             gripper_lane.check()
             if camera:
                 camera.check()
-            if feedback is None:
-                feedback = asyncio.create_task(poll_feedback())
-            if feedback.done():
-                feedback.result()
-            if latest["received_at"] != processed_feedback_stamp:
-                processed_feedback_stamp = latest["received_at"]
+            if feedback is None and now-last_feedback >= .05:
+                feedback = asyncio.create_task(rpc.snapshot())
+                last_feedback = now
+            if feedback is not None and feedback.done():
+                latest = feedback.result()
+                feedback = None
                 q = np.array(latest["state"]["joint_deg"])
                 low, high = (np.array(v) for v in prepared["bounds"])
                 if np.any(q < low+config.joint_margin_deg) or np.any(q > high-config.joint_margin_deg):
@@ -834,7 +920,8 @@ async def run_follow(robot, config, output, *, direct=False, seconds=None, recor
                 seen_epoch = gate.epoch
                 interlock = gate.pending_interlock or dict(reason=gate.reason)
                 gate.pending_interlock = None
-                recorder.event("interlock", **interlock)
+                recorder.event("interlock", **interlock,
+                               input_timing=(source.diagnostics() if hasattr(source, 'diagnostics') else None))
                 print("已暂停跟随："+interlock['reason'], flush=True)
                 await stream.close()
                 if direct and rpc.motion_attempts:
@@ -891,7 +978,6 @@ async def run_follow(robot, config, output, *, direct=False, seconds=None, recor
             def hardware_permit():
                 t = time.monotonic()
                 return (not stop.is_set() and gate.fresh(t)
-                        and feedback is not None and not feedback.done()
                         and t-latest["received_at"] <= robot.feedback_timeout_s
                         and t-profile_stamp <= .5)
             def permit(epoch=gate.epoch):
@@ -933,11 +1019,18 @@ async def run_follow(robot, config, output, *, direct=False, seconds=None, recor
                     tracking = TrackingMonitor(config)
                 if now >= deadline:
                     planned_target = gate.target[:]
+                    plan_started = time.monotonic()
                     try:
                         q, pose = await plan_step(planner, planned_target, 1/config.control_hz)
                     except ValueError as error:
                         gate.trip_motion(str(error))
                         continue
+                    finally:
+                        last_planning_ms = (time.monotonic()-plan_started)*1000
+                        timing = report['planning_timing']
+                        timing['ticks'] += 1
+                        timing['over_budget_ticks'] += int(last_planning_ms > 1000/config.control_hz)
+                        timing['maximum_ms'] = max(timing['maximum_ms'], last_planning_ms)
                     if planner.limiting_reason != last_plan_reason:
                         recorder.event('planner_limited' if planner.limiting_reason else 'planner_resumed',
                                        reason=planner.limiting_reason, scale=planner.trajectory_scale,
@@ -1011,7 +1104,8 @@ async def run_follow(robot, config, output, *, direct=False, seconds=None, recor
                       stop_commands_sent=rpc.stop_attempts,
                       native_frames=getattr(source, "frames", 0),
                       native_valid_tracking_frames=getattr(source, "tracking_frames", 0),
-                      native_last_error=getattr(source, "last_error", None))
+                      native_last_error=getattr(source, "last_error", None),
+                      input_timing=(source.diagnostics() if hasattr(source, 'diagnostics') else None))
         if stream.periods:
             report["active_send_interval_ms"] = dict(median=float(np.median(stream.periods)*1000),
                                                       maximum=max(stream.periods)*1000)
@@ -1057,7 +1151,7 @@ def main():
     a = p.parse_args()
     c, robot = FollowConfig.load(a.config), Config.load(a.robot_config)
     if a.direct and not c.direction_configured:
-        p.error("先运行 bash robot.sh direction 手动设置方向，再用 preview 核对")
+        p.error("先运行 bash robot.sh direction 或 calibrate-axes 设置方向，再用 preview 核对")
     if a.record and (c.camera_serial == "UNCONFIGURED_WRIST" or not c.camera_external_serial):
         p.error("双机位录制需要配置 wrist 和 external 两个不同的相机序列号")
     if a.seconds is not None and (not math.isfinite(a.seconds) or not 0 < a.seconds <= c.max_duration_s):

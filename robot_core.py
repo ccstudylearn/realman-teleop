@@ -18,7 +18,7 @@ def parse_axes(text):
         raise ValueError("Each VR axis must occur exactly once")
     return [("xyz".index(part[-1]), -1 if part.startswith("-") else 1) for part in parts]
 
-def decode_state(response):
+def decode_state(response, *, allow_fault=False):
     state = response["arm_state"]
     joints, pose, errors = state["joint"], state["pose"], state["err"]
     if len(joints) != 6 or len(pose) != 6 or not errors:
@@ -26,7 +26,7 @@ def decode_state(response):
     if not all(isinstance(v, (int, float)) and not isinstance(v, bool)
                and math.isfinite(v) for v in joints + pose + errors):
         raise ValueError("Invalid robot feedback values")
-    if any(value != 0 for value in errors):
+    if not allow_fault and any(value != 0 for value in errors):
         raise ValueError("Robot reports an error: " + str(errors))
     degrees = [value / 1000 for value in joints]
     return {
@@ -281,10 +281,10 @@ class ArmRPC:
             with suppress(Exception):
                 await asyncio.wait_for(writer.wait_closed(), .1)
 
-    async def snapshot(self):
+    async def snapshot(self, *, allow_fault=False):
         # Timestamp BEFORE queries, so time spent reading never refreshes stale data.
         stamp = time.monotonic()
-        state = decode_state(await self.call("get_current_arm_state"))
+        state = decode_state(await self.call("get_current_arm_state"), allow_fault=allow_fault)
         trajectory = await self.call("get_arm_current_trajectory")
         if not isinstance(trajectory.get("type"), str):
             raise ValueError("Unknown controller trajectory response")
@@ -316,7 +316,7 @@ def validate_profile(c, profile):
     if profile["get_program_run_state"].get("run_state") != 0:
         raise ValueError("An online program is running or paused")
 
-async def preflight(rpc):
+async def preflight(rpc, *, settle_timeout_s=0.0):
     c = rpc.c
     profile = await rpc.profile()
     validate_profile(c, profile)
@@ -330,17 +330,24 @@ async def preflight(rpc):
             or not all(type(v) is int for v in low + high)
             or any(a >= b for a, b in zip(low, high))):
         raise ValueError("Invalid controller joint limits")
-    samples = []
-    for _ in range(4):
-        s = await rpc.snapshot()
-        if s["trajectory"]["type"] != "none":
-            raise ValueError("Robot has an active trajectory; do not share control")
-        samples.append(s)
-        await asyncio.sleep(.1)
-    anchor = samples[-1]["state"]
-    for s in samples:
-        if (distance(s["state"]["tcp_pose_m_rad"][:3], anchor["tcp_pose_m_rad"][:3]) > .0001
-                or max(abs(a - b) for a, b in zip(s["state"]["joint_deg"], anchor["joint_deg"])) > .03):
+    deadline = time.monotonic() + settle_timeout_s
+    while True:
+        samples = []
+        for _ in range(4):
+            snapshot = await rpc.snapshot()
+            if snapshot["trajectory"]["type"] != "none":
+                raise ValueError("Robot has an active trajectory; do not share control")
+            samples.append(snapshot)
+            await asyncio.sleep(.1)
+        anchor = samples[-1]["state"]
+        stationary = all(
+            distance(sample["state"]["tcp_pose_m_rad"][:3], anchor["tcp_pose_m_rad"][:3]) <= .0001
+            and max(abs(a - b) for a, b in zip(sample["state"]["joint_deg"], anchor["joint_deg"])) <= .03
+            for sample in samples
+        )
+        if stationary:
+            break
+        if time.monotonic() >= deadline:
             raise ValueError("Robot is not stationary at startup")
     bounds = ([v / 1000 for v in low], [v / 1000 for v in high])
     check_startup_joints(samples[-1], bounds)
@@ -367,7 +374,9 @@ async def controlled_stop(rpc, recorder, observer=None):
         deadline, since, reference = time.monotonic() + 2., None, None
         while time.monotonic() < deadline:
             try:
-                snap = await rpc.snapshot()
+                # A latched controller fault still allows read-only stop verification.
+                # All startup and motion feedback uses the strict default.
+                snap = await rpc.snapshot(allow_fault=True)
                 if observer is not None:
                     observer(snap)
                 q = snap["state"]["joint_deg"]
@@ -375,12 +384,14 @@ async def controlled_stop(rpc, recorder, observer=None):
                     if reference is None or max(abs(a-b) for a,b in zip(q, reference)) > .03:
                         reference, since = q, time.monotonic()
                     if time.monotonic() - since >= .3:
-                        recorder.event("stop_verified", stop_attempts=rpc.stop_attempts)
+                        recorder.event("stop_verified", stop_attempts=rpc.stop_attempts,
+                                       controller_errors=snap["state"]["errors"])
                         return
                 else:
                     reference = since = None
             except Exception as error:
                 errors.append(str(error))
+                reference = since = None
             await asyncio.sleep(.05)
     recorder.event("stop_unverified", errors=errors)
     raise RuntimeError("Cannot verify robot stop. Use the physical E-stop and inspect the controller.")

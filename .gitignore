@@ -19,3 +19,5 @@ client/build/
 .idea/
 .vscode/
 *~
+config/camera_mount.json
+diagnostics/
